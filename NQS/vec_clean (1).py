@@ -1,0 +1,151 @@
+import tensorflow as tf
+import numpy as np
+from tensorflow import keras
+import matplotlib.pyplot as plt
+
+callbacks = keras.callbacks
+layers = keras.layers
+rng = np.random.default_rng()
+print("keras", keras.__version__)
+
+def init_lat(lx, ly):
+    """Initialize spin lattice with random -1 or +1."""
+    rng = np.random.default_rng()
+    lattice = 2 * (0.5 - rng.integers(0, 2, size=(lx, ly)))
+    return lattice
+'''
+def gen_bonds(lattice):
+    """Generate nearest-neighbor bond list for given lattice."""
+    bonds = []
+    lx, ly = lattice.shape
+    def red_dim(x, y):
+        return x * ly + y
+
+    for i in range(lx):
+        for j in range(ly):
+            n = red_dim(i, j)
+            b1 = red_dim((i + 1) % lx, j)
+            b2 = red_dim(i, (j + 1) % ly)
+            bonds.append([n, b1])
+            bonds.append([n, b2])
+    return np.array(bonds)
+
+def update_bond_config(lattice, bonds, T, J=None):
+    """Update bonds using bond percolation rule."""
+    lx, ly = lattice.shape
+    if J is None:
+        J = 1
+    weights = np.zeros(len(bonds))
+    p_w = 1 - np.exp(-(2 * J) / T)
+    for b in range(len(bonds)):
+        s1 = (bonds[b, 0] // ly, np.mod(bonds[b, 0], ly))
+        s2 = (bonds[b, 1] // ly, np.mod(bonds[b, 1], ly))
+        if (lattice[s1] == lattice[s2] and (np.random.rand() < p_w)):
+            weights[b] = 1
+    return weights
+
+'''
+
+def spins_to_tensor(spins):
+    """Convert spins array to tf.float32 tensor."""
+    return tf.convert_to_tensor(spins, dtype=tf.float32)
+
+@tf.function
+def metropolis_sample_tf(model, initial_config, n_walkers, n_steps=100):
+    """
+    Vectorized Metropolis-Hastings sampling for n_walkers.
+    initial_config: shape (L1, L2, ...), values in {-1, +1}
+    Returns: tensor shape (n_walkers, *L, 1)
+    """
+    init = tf.squeeze(tf.cast(tf.convert_to_tensor(initial_config), dtype=tf.float32))
+    new_shape = tf.concat([[1], tf.shape(init), [1]], axis=0)
+    init = tf.reshape(init, new_shape)  # (1, *L, 1)-> (batch,*L,channel)
+    lattice_shape = tf.shape(init)[1:-1]
+    N = tf.reduce_prod(lattice_shape)
+    configs = tf.repeat(init, repeats=n_walkers, axis=0)  # (n_walkers, *L, 1)
+
+    log_psi = tf.reshape(model(configs, training=False), (n_walkers,))  # (n_walkers,)
+
+    for step in tf.range(n_steps):
+        idx = tf.random.uniform((n_walkers,), minval=0, maxval=N, dtype=tf.int32)
+        mask_flat = tf.one_hot(idx, N, dtype=tf.float32)
+        mask = tf.reshape(mask_flat, tf.concat([[n_walkers], lattice_shape, [1]], axis=0))
+        mult = 1.0 - 2.0 * mask
+        proposed = configs * mult
+
+        log_psi_prop = tf.reshape(model(proposed, training=False), (n_walkers,))
+        log_ratio = 2.0 * (log_psi_prop - log_psi)
+        accept_prob = tf.exp(tf.clip_by_value(log_ratio, -50.0, 50.0))
+        accept = tf.random.uniform((n_walkers,)) < tf.minimum(accept_prob, 1.0)
+
+        bcast_shape = tf.concat([[n_walkers], tf.ones(tf.rank(configs) - 1, tf.int32)], axis=0)
+        accept_mask = tf.reshape(accept, bcast_shape)
+        configs = tf.where(accept_mask, proposed, configs)
+        log_psi = tf.where(tf.reshape(tf.cast(accept, tf.bool), (n_walkers,)), log_psi_prop, log_psi)
+
+    return configs  # (n_walkers, *L, 1)
+
+@tf.function
+def sum_phys(samp):
+    """Sum over all physical (spatial) axes."""
+    axes = tf.range(1, tf.rank(samp))
+    return tf.reshape(tf.reduce_sum(samp, axis=axes, keepdims=True),(tf.shape(samp)[0],))
+
+@tf.function
+def local_energy_tf(model, samples, J, h, tr):
+    """
+    Compute local energy for VMC (vectorized).
+    samples: (n_samples, *L, 1) with values +/-1
+    Returns: (eloc, log_psi), eloc shape (n_samples,)
+    """
+    samples = tf.cast(samples, tf.float32)
+    n_samples = tf.shape(samples)[0]
+    lattice_shape = tf.shape(tf.squeeze(samples[-1]))
+    a = tf.rank(tf.squeeze(samples[-1]))
+    N = tf.reduce_prod(lattice_shape)
+
+    log_psi = tf.reshape(model(samples, training=tr), (n_samples, 1))
+
+    # Diagonal energy
+    new_shape = tf.concat([[n_samples], lattice_shape, [1]], axis=0)
+    s = tf.reshape(samples, new_shape)
+    spatial_axes = tf.range(1, a + 1)
+    diag_energy = tf.zeros((n_samples,), dtype=tf.float32)
+    for n in spatial_axes:
+        s_shift = tf.roll(s, shift=-1, axis=n)
+        diag_energy +=  tf.squeeze(sum_phys(s_shift*s))
+        #diag_energy = tf.reshape(diag_energy, (n_samples,))
+    diag_energy = -J*tf.reshape(diag_energy,(n_samples,))
+    # Off-diagonal: single-spin flips
+    I = tf.eye(N, dtype=tf.float32)
+    multipliers_flat = 1.0 - 2.0 * I
+    n_shape = tf.concat([[n_samples], [1], lattice_shape, [1]], axis=0)
+    samples_exp = tf.reshape(samples, n_shape)
+    mult_exp = tf.reshape(multipliers_flat, tf.concat([[1],[N], lattice_shape, [1]], axis=0))
+    flipped =  mult_exp*samples_exp  # (n_samples, N, *L, 1)
+
+    flipped_reshaped = tf.reshape(flipped, tf.concat([[n_samples * N], lattice_shape, [1]], axis=0))
+    log_psi_flips = tf.reshape(model(flipped_reshaped, training=tr), (n_samples, N))
+
+    ratio = tf.exp(log_psi_flips - log_psi)
+    off_diag = -h * tf.reduce_sum(ratio, axis=1)
+
+    eloc = tf.squeeze(diag_energy) + tf.squeeze(off_diag)
+    return eloc, log_psi
+@tf.function
+def vmc_training_step_tf(model, optimizer, samples, J, h):
+    """
+    One VMC gradient step for neural quantum states (vectorized).
+    samples: Tensor (n_samples, *L, 1)
+    model: Neural quantum state, input shape (batch, *L, 1)
+    Returns: (mean energy, VMC loss)
+    """
+    samples = tf.cast(samples, tf.float32)
+    with tf.GradientTape() as tape:
+        eloc, log_psi = local_energy_tf(model, samples, J, h, tr=False)
+        E_mean = tf.reduce_mean(eloc)
+        # Squeeze log_psi for safety if needed
+        loss = 2.0 * tf.reduce_mean((tf.stop_gradient(eloc) - E_mean) * tf.squeeze(log_psi))
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return E_mean, loss
