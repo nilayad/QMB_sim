@@ -2,53 +2,64 @@ import tensorflow as tf
 import numpy as np
 from tensorflow import keras
 import matplotlib.pyplot as plt
+import gc
+from keras import backend as K
+from keras import callbacks
 
 callbacks = keras.callbacks
 layers = keras.layers
 rng = np.random.default_rng()
 print("keras", keras.__version__)
 
-def init_lat(lx, ly):
-    """Initialize spin lattice with random -1 or +1."""
-    rng = np.random.default_rng()
-    lattice = 2 * (0.5 - rng.integers(0, 2, size=(lx, ly)))
-    return lattice
-'''
-def gen_bonds(lattice):
-    """Generate nearest-neighbor bond list for given lattice."""
-    bonds = []
-    lx, ly = lattice.shape
-    def red_dim(x, y):
-        return x * ly + y
+#___________________________________________________________________________________________
+#train nqs
+def run_training(
+    num_epoch, init_config, 
+                 n_samples, met_steps, 
+                 lr,model, J, h,
+                 optimizer=None,E=None,lss_val=None 
+                ):
+    #import importlib
+    #importlib.reload(vec_nqs)
+    num_epochs = num_epoch
+    n_samples = n_samples
+    met_steps = met_steps
+    learning_rate = lr
+    lat_shape = tf.shape(tf.squeeze(tf.convert_to_tensor(init_config)))
+    if optimizer==None:
+        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        dummy_var = tf.Variable(tf.zeros(1))
+    if E==None:
+        E = []
+    if lss_val==None:
+        lss_val = []
+    #nqs = model
+    # === VMC Training Loop ===
+    #nqs = model_nqs  # for naming consistency
+    #gradients=[]
+    for epoch in range(num_epochs):
+        # Sample new configs
+        samples = metropolis_sample_tf( 
+            model, init_config, 
+            n_walkers=n_samples,
+            n_steps=met_steps
+        )
+        # Compute average local energy (pass J and h!)
+        #local_energies = vec_nqs.local_energy_tf(model_nqs, samples, J, h,tr=False)
+        #E_avg = np.mean(local_energies[0])
+        # One VMC step
+        E_avg_tf, loss_val = vmc_training_step_tf(model, optimizer, samples, J, h)
+        E.append(E_avg_tf)
+        lss_val.append(loss_val)
+        
+        print(f"Epoch {epoch+1}: Energy = {E_avg_tf:.6f}, Loss = {loss_val:.6f}")
+        # Optionally, update initial_config for next epoch
+        initial_config = tf.reshape(samples[-1],lat_shape)
+    
+    return E,lss_val, optimizer
 
-    for i in range(lx):
-        for j in range(ly):
-            n = red_dim(i, j)
-            b1 = red_dim((i + 1) % lx, j)
-            b2 = red_dim(i, (j + 1) % ly)
-            bonds.append([n, b1])
-            bonds.append([n, b2])
-    return np.array(bonds)
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def update_bond_config(lattice, bonds, T, J=None):
-    """Update bonds using bond percolation rule."""
-    lx, ly = lattice.shape
-    if J is None:
-        J = 1
-    weights = np.zeros(len(bonds))
-    p_w = 1 - np.exp(-(2 * J) / T)
-    for b in range(len(bonds)):
-        s1 = (bonds[b, 0] // ly, np.mod(bonds[b, 0], ly))
-        s2 = (bonds[b, 1] // ly, np.mod(bonds[b, 1], ly))
-        if (lattice[s1] == lattice[s2] and (np.random.rand() < p_w)):
-            weights[b] = 1
-    return weights
-
-'''
-
-def spins_to_tensor(spins):
-    """Convert spins array to tf.float32 tensor."""
-    return tf.convert_to_tensor(spins, dtype=tf.float32)
 
 @tf.function
 def metropolis_sample_tf(model, initial_config, n_walkers, n_steps=100):
@@ -149,3 +160,140 @@ def vmc_training_step_tf(model, optimizer, samples, J, h):
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return E_mean, loss
+
+
+
+#-------------------------------------------------------------------------------------------
+#nqs wavefunction
+
+
+class NQSWavefunction(keras.Model):
+    def __init__(
+        self,
+        dimension,
+        L,
+        J,
+        h,
+        network_config=None
+    ):
+        """
+        Args:
+            dimension (int): System dimension.
+            L (int): Input length.
+            J (float): Coupling constant (model param).
+            h (float): Field strength (model param).
+            network_config (list of dict, optional): List of layer specifications.
+                Each dict should have keys:
+                    - 'type': keras.layers class or string ('Dense', 'Flatten', etc.)
+                    - 'units': for Dense layers (int)
+                    - 'activation': (string or None)
+                Example:
+                    [
+                        {'type': 'Flatten'},
+                        {'type': 'Dense', 'units': 128, 'activation': 'relu'},
+                        {'type': 'Dense', 'units': 1, 'activation': None}
+                    ]
+                If None, a default architecture is used.
+        """
+        super().__init__()
+        self.dimension = dimension
+        self.L = L
+        self.J = J
+        self.h = h
+        self.model = self.build_model(network_config)
+
+    def build_model(self, network_config):
+        model_layers = []
+
+        # Always start with input layer
+        model_layers.append(layers.Input(shape=(self.L, 1)))
+
+        if network_config is None:
+            # Default architecture, as in original function
+            model_layers += [
+                layers.Flatten(),
+                layers.Dense(132, activation='relu'),
+                layers.Dense(32, activation='relu'),
+                layers.Dense(150, activation='relu'),
+                layers.Dense(64, activation='relu'),
+                layers.Dense(128, activation='relu'),
+                layers.Dense(64, activation='relu'),
+                layers.Dense(1, activation=None),
+            ]
+        else:
+            # Custom architecture
+            for layer_cfg in network_config:
+                layer_type = layer_cfg.get('type')
+                if isinstance(layer_type, str):
+                    # Convert string to class, supports main types
+                    if layer_type.lower() == 'dense':
+                        layer = layers.Dense(
+                            units=layer_cfg.get('units'),
+                            activation=layer_cfg.get('activation', None)
+                        )
+                    elif layer_type.lower() == 'flatten':
+                        layer = layers.Flatten()
+                    elif layer_type.lower() == 'dropout':
+                        layer = layers.Dropout(layer_cfg.get('rate', 0.5))
+                    else:
+                        raise ValueError(f"Unsupported layer type: {layer_type}")
+                else:
+                    # Assume layer_type is a keras.layers class
+                    layer = layer_type(**{k:v for k,v in layer_cfg.items() if k != 'type'})
+                model_layers.append(layer)
+
+        return keras.Sequential(model_layers)
+
+    def call(self, inputs, training=False):
+        return self.model(inputs, training=training)
+
+    def summary(self):
+        self.model.summary()
+
+    def get_model(self):
+        return self.model
+
+
+##__________________________________________________________________________________________
+
+#support functions
+
+def init_lat(lx, ly):
+    """Initialize spin lattice with random -1 or +1."""
+    rng = np.random.default_rng()
+    lattice = 2 * (0.5 - rng.integers(0, 2, size=(lx, ly)))
+    return lattice
+    
+def gen_bonds(lattice):
+    """Generate nearest-neighbor bond list for given lattice."""
+    bonds = []
+    lx, ly = lattice.shape
+    def red_dim(x, y):
+        return x * ly + y
+
+    for i in range(lx):
+        for j in range(ly):
+            n = red_dim(i, j)
+            b1 = red_dim((i + 1) % lx, j)
+            b2 = red_dim(i, (j + 1) % ly)
+            bonds.append([n, b1])
+            bonds.append([n, b2])
+    return np.array(bonds)
+
+def update_bond_config(lattice, bonds, T, J=None):
+    """Update bonds using bond percolation rule."""
+    lx, ly = lattice.shape
+    if J is None:
+        J = 1
+    weights = np.zeros(len(bonds))
+    p_w = 1 - np.exp(-(2 * J) / T)
+    for b in range(len(bonds)):
+        s1 = (bonds[b, 0] // ly, np.mod(bonds[b, 0], ly))
+        s2 = (bonds[b, 1] // ly, np.mod(bonds[b, 1], ly))
+        if (lattice[s1] == lattice[s2] and (np.random.rand() < p_w)):
+            weights[b] = 1
+    return weights
+
+def spins_to_tensor(spins):
+    """Convert spins array to tf.float32 tensor."""
+    return tf.convert_to_tensor(spins, dtype=tf.float32)
